@@ -8,6 +8,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+# Exceptions réseau (pour répondre proprement au client)
+from requests.exceptions import ConnectTimeout, ReadTimeout, Timeout as ReqTimeout, RequestException
+
 # =========================
 # ENV / Réglages
 # =========================
@@ -59,7 +62,7 @@ class FetchPayload(BaseModel):
 # =========================
 # App & CORS
 # =========================
-app = FastAPI(title="Pronote JSON API (time-box)")
+app = FastAPI(title="Pronote JSON API (time-box + robust errors)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -158,6 +161,7 @@ def probe_login(username: str, password: str):
     """Vérifie uniquement le login Pronote, avec timeouts réseau + budget court."""
     if MOCK:
         return {"ok": True, "mode": "MOCK"}
+
     # Timeout réseau global pour requests (utilisé par pronotepy)
     import requests as _requests
     _orig = _requests.Session.request
@@ -179,6 +183,10 @@ def probe_login(username: str, password: str):
             client = with_timeout(ex, _login, LOGIN_TIMEOUT)
         except FuturesTimeout:
             raise HTTPException(504, f"login_timeout>{LOGIN_TIMEOUT}s")
+        except (ConnectTimeout, ReadTimeout, ReqTimeout) as e:
+            raise HTTPException(504, f"login_network_timeout:{type(e).__name__}")
+        except RequestException as e:
+            raise HTTPException(502, f"login_network_error:{type(e).__name__}")
 
     if not client.logged_in:
         raise HTTPException(401, "invalid_credentials")
@@ -234,23 +242,49 @@ def pronote_fetch(payload: FetchPayload):
     from pronotepy.ent import atrium_sud
 
     with ThreadPoolExecutor(max_workers=4) as ex:
+        # --- login protégé ---
         try:
             def _login():
                 return pronotepy.Client(PRONOTE_URL, username=payload.username, password=payload.password, ent=atrium_sud)
             client = with_timeout(ex, _login, LOGIN_TIMEOUT)
         except FuturesTimeout:
-            # Réponse partielle claire si login trop long
             return {
-                "notes": {"periods":[]},
-                "lessons": {"lessons":[]},
-                "lessons_next7": {"lessons":[]},
-                "homework_next7": {"homework":[]},
+                "notes": {"periods":[]}, "lessons": {"lessons":[]},
+                "lessons_next7": {"lessons":[]}, "homework_next7": {"homework":[]},
                 "meta": {
                     "school_url": PRONOTE_URL,
                     "range_past": {"start": start_d.isoformat(), "end": end_d.isoformat()},
                     "range_next7": {"start": f_start.isoformat(), "end": f_end.isoformat()},
                     "status": {"login": f"timeout>{LOGIN_TIMEOUT}s"},
                     "errors": {"login": f"timeout>{LOGIN_TIMEOUT}s"},
+                    "timing": {"total_s": round(time.perf_counter()-t0, 3)},
+                    "include_content": INCLUDE_CONTENT
+                }
+            }
+        except (ConnectTimeout, ReadTimeout, ReqTimeout) as e:
+            return {
+                "notes": {"periods":[]}, "lessons": {"lessons":[]},
+                "lessons_next7": {"lessons":[]}, "homework_next7": {"homework":[]},
+                "meta": {
+                    "school_url": PRONOTE_URL,
+                    "range_past": {"start": start_d.isoformat(), "end": end_d.isoformat()},
+                    "range_next7": {"start": f_start.isoformat(), "end": f_end.isoformat()},
+                    "status": {"login": "network_timeout"},
+                    "errors": {"login": f"network_timeout:{type(e).__name__}"},
+                    "timing": {"total_s": round(time.perf_counter()-t0, 3)},
+                    "include_content": INCLUDE_CONTENT
+                }
+            }
+        except RequestException as e:
+            return {
+                "notes": {"periods":[]}, "lessons": {"lessons":[]},
+                "lessons_next7": {"lessons":[]}, "homework_next7": {"homework":[]},
+                "meta": {
+                    "school_url": PRONOTE_URL,
+                    "range_past": {"start": start_d.isoformat(), "end": end_d.isoformat()},
+                    "range_next7": {"start": f_start.isoformat(), "end": f_end.isoformat()},
+                    "status": {"login": "network_error"},
+                    "errors": {"login": f"network_error:{type(e).__name__}"},
                     "timing": {"total_s": round(time.perf_counter()-t0, 3)},
                     "include_content": INCLUDE_CONTENT
                 }
