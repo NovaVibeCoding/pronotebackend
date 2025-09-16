@@ -12,8 +12,8 @@ load_dotenv()
 
 PRONOTE_URL = os.getenv("PRONOTE_URL", "https://0061884r.index-education.net/pronote/eleve.html")
 ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "https://ton-front.example")
-MOCK = os.getenv("MOCK", "0").strip().lower() in {"1","true","yes"}  # prod: REAL par défaut
-INCLUDE_CONTENT = os.getenv("INCLUDE_CONTENT", "0").strip().lower() in {"1","true","yes"}peut être très lent
+MOCK = os.getenv("MOCK", "0").strip().lower() in {"1","true","yes"} 
+INCLUDE_CONTENT = os.getenv("INCLUDE_CONTENT", "0").strip().lower() in {"1","true","yes"}
 
 # ---- Utils ----
 def safe_float(v):
@@ -102,7 +102,7 @@ def build_lessons(client, start_d: date, end_d: date) -> Dict[str, Any]:
     for c in lessons:
         subj_name = getattr(c.subject, "name", "?")
         subj_code = getattr(c.subject, "code", None)
-        # ⚠️ Évite d'accéder à c.content si INCLUDE_CONTENT=False (souvent très lent)
+
         content = None
         if INCLUDE_CONTENT:
             content = {
@@ -193,8 +193,7 @@ def pronote_fetch(payload: FetchPayload):
         timing: Dict[str,float] = {}
         errors: Dict[str,str] = {}
 
-        # Threads + timeouts (viser total ~ 15–18 s max)
-        # notes: 6s, lessons_past: 6s, lessons_next7: 4s, homework: 4s
+
         with ThreadPoolExecutor(max_workers=4) as ex:
             tasks = {
                 "notes":       lambda: build_notes(client),
@@ -246,6 +245,6 @@ def pronote_fetch(payload: FetchPayload):
 
 if __name__ == "__main__":
     import os, uvicorn
-    port = int(os.getenv("PORT", "8080"))  # Render fournit $PORT
+    port = int(os.getenv("PORT", "8080"))  
     uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
 
