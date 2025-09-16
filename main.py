@@ -11,9 +11,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 PRONOTE_URL = os.getenv("PRONOTE_URL", "https://0061884r.index-education.net/pronote/eleve.html")
-ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*")
-MOCK = os.getenv("MOCK", "0").strip().lower() in {"1", "true", "yes"}  # par défaut REAL
-INCLUDE_CONTENT = os.getenv("INCLUDE_CONTENT", "0").strip().lower() in {"1", "true", "yes"}  # c.content peut être très lent
+ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "https://ton-front.example")
+MOCK = os.getenv("MOCK", "0").strip().lower() in {"1","true","yes"}  # prod: REAL par défaut
+INCLUDE_CONTENT = os.getenv("INCLUDE_CONTENT", "0").strip().lower() in {"1","true","yes"}peut être très lent
 
 # ---- Utils ----
 def safe_float(v):
@@ -245,6 +245,7 @@ def pronote_fetch(payload: FetchPayload):
         raise HTTPException(502, f"connexion_pronote_failed: {type(e).__name__}")
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8081, log_level="info")
+    import os, uvicorn
+    port = int(os.getenv("PORT", "8080"))  # Render fournit $PORT
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
 
