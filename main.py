@@ -1,18 +1,49 @@
-import os, sys
+import os, time
 from datetime import date, datetime, timedelta
 from typing import Optional, Dict, Any, List
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-load_dotenv()  # charge .env si présent
+load_dotenv()
 
 PRONOTE_URL = os.getenv("PRONOTE_URL", "https://0061884r.index-education.net/pronote/eleve.html")
 ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*")
-MOCK = os.getenv("MOCK", "1") == "1"  # 1 = test sans Pronote
+MOCK = os.getenv("MOCK", "0").strip().lower() in {"1", "true", "yes"}  # par défaut REAL
+INCLUDE_CONTENT = os.getenv("INCLUDE_CONTENT", "0").strip().lower() in {"1", "true", "yes"}  # c.content peut être très lent
 
+# ---- Utils ----
+def safe_float(v):
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        s = v.strip().replace(",", ".")
+        if s == "" or s.lower() in {"abs", "ab", "nn", "n.n", "na", "n/a", "null", "-"}:
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    return None
+
+def fmt_dt(d) -> Optional[str]:
+    try:
+        if d is None:
+            return None
+        if isinstance(d, datetime):
+            return d.date().isoformat()
+        if isinstance(d, date):
+            return d.isoformat()
+        return str(d)
+    except Exception:
+        return None
+
+# ---- Models ----
 class FetchPayload(BaseModel):
     username: str
     password: str
@@ -20,7 +51,8 @@ class FetchPayload(BaseModel):
     start: Optional[str] = None
     end:   Optional[str] = None
 
-app = FastAPI(title="Pronote JSON API (Thonny)")
+# ---- App ----
+app = FastAPI(title="Pronote JSON API (optimisée)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,105 +62,189 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MOCK_NOTES = {
-    "periods": [
-        {"name": "Trimestre 1", "grades": [
-            {"date":"2025-09-10","subjectId":"MATH","subjectLabel":"Maths","value":15,"outOf":20,"coefficient":2,"comment":"Bon travail"},
-            {"date":"2025-09-12","subjectId":"HIST","subjectLabel":"Histoire","value":13,"outOf":20}
-        ]}
-    ]
-}
-MOCK_LESSONS = {
-    "lessons":[
-        {"date":"2025-09-15","start":"09:00","end":"10:00","subjectId":"MATH","subjectLabel":"Maths","room":"B12","canceled":False,
-         "content":{"title":"Équations","description":"Méthodes de résolution"}},
-        {"date":"2025-09-15","start":"10:15","end":"11:15","subjectId":"FR","subjectLabel":"Français","room":"C03","canceled":False,
-         "content":{"title":"Argumentation","description":None}}
-    ]
-}
+# ---- MOCK ----
+MOCK_NOTES = {"periods":[{"name":"T1","grades":[
+    {"date":"2025-09-10","subjectId":"MATH","subjectLabel":"Maths","value":15,"outOf":20},
+    {"date":"2025-09-12","subjectId":"HIST","subjectLabel":"Histoire","value":13,"outOf":20}
+]}]}
+MOCK_LESSONS_PAST = {"lessons":[{"date":"2025-09-15","start":"09:00","end":"10:00","subjectId":"MATH","subjectLabel":"Maths","room":"B12","canceled":False}]}
+MOCK_LESSONS_NEXT7 = {"lessons":[{"date":"2025-09-18","start":"14:00","end":"15:00","subjectId":"PHY","subjectLabel":"Physique","room":"Labo","canceled":False}]}
+MOCK_HOMEWORK_NEXT7 = {"homework":[{"id":"hw1","given":"2025-09-15","due":"2025-09-18","subjectId":"MATH","subjectLabel":"Maths","title":"Exos 12-15","description":"Équations","done":False}]}
 
-@app.get("/")
-def root():
-    return {"ok": True, "service": "pronote-json-api", "mode": "MOCK" if MOCK else "REAL"}
+@app.get("/ping")
+def ping():
+    return {"ok": True, "mode": "MOCK" if MOCK else "REAL", "include_content": INCLUDE_CONTENT}
+
+# ---- Core helpers (sync) ----
+def build_notes(client) -> Dict[str, Any]:
+    out = {"periods": []}
+    for period in client.periods:
+        grades = []
+        for g in sorted(period.grades, key=lambda x: x.date or date.min):
+            subj_name = getattr(g.subject, "name", g.subject)
+            subj_code = getattr(g.subject, "code", None)
+            grades.append({
+                "date": g.date.strftime("%Y-%m-%d") if g.date else None,
+                "subjectId": subj_code or subj_name,
+                "subjectLabel": subj_name,
+                "value": safe_float(getattr(g, "grade", None)),
+                "outOf": safe_float(getattr(g, "out_of", None)),
+                "coefficient": safe_float(getattr(g, "coefficient", None)),
+                "comment": getattr(g, "comment", None),
+            })
+        out["periods"].append({"name": period.name, "grades": grades})
+    return out
+
+def build_lessons(client, start_d: date, end_d: date) -> Dict[str, Any]:
+    lessons = client.lessons(start_d, end_d)
+    lessons.sort(key=lambda c: (c.start, c.end))
+    arr: List[Dict[str, Any]] = []
+    for c in lessons:
+        subj_name = getattr(c.subject, "name", "?")
+        subj_code = getattr(c.subject, "code", None)
+        # ⚠️ Évite d'accéder à c.content si INCLUDE_CONTENT=False (souvent très lent)
+        content = None
+        if INCLUDE_CONTENT:
+            content = {
+                "title": getattr(getattr(c, "content", None), "title", None),
+                "description": getattr(getattr(c, "content", None), "description", None)
+            }
+        arr.append({
+            "date": c.start.strftime("%Y-%m-%d"),
+            "start": c.start.strftime("%H:%M"),
+            "end": c.end.strftime("%H:%M"),
+            "subjectId": subj_code or subj_name,
+            "subjectLabel": subj_name,
+            "room": c.classroom or None,
+            "canceled": bool(c.canceled),
+            **({"content": content} if INCLUDE_CONTENT else {})
+        })
+    return {"lessons": arr}
+
+def build_homework(client, start_d: date, end_d: date) -> Dict[str, Any]:
+    try:
+        hws = client.homework(start_d, end_d)
+    except Exception:
+        hws = getattr(client, "homeworks", lambda a,b: [])(start_d, end_d)
+    arr: List[Dict[str, Any]] = []
+    for h in sorted(hws, key=lambda x: getattr(x, "due_date", None) or getattr(x, "date", None) or date.max):
+        subj = getattr(h, "subject", None)
+        subj_name = getattr(subj, "name", str(subj) if subj else "?")
+        subj_code = getattr(subj, "code", None)
+        given = getattr(h, "date", None) or getattr(h, "assigned_date", None) or getattr(h, "given_date", None)
+        due   = getattr(h, "due_date", None) or getattr(h, "for_date", None)
+        arr.append({
+            "id": getattr(h, "id", None) or f"hw_{fmt_dt(given)}_{subj_code or subj_name}",
+            "given": fmt_dt(given),
+            "due": fmt_dt(due),
+            "subjectId": subj_code or subj_name,
+            "subjectLabel": subj_name,
+            "title": getattr(h, "title", None) or getattr(h, "description", None),
+            "description": getattr(h, "description", None),
+            "done": bool(getattr(h, "done", False)),
+        })
+    return {"homework": arr}
+
+def with_timeout(executor: ThreadPoolExecutor, fn, timeout_s: float):
+    fut = executor.submit(fn)
+    return fut.result(timeout=timeout_s)
 
 @app.post("/pronote/fetch")
 def pronote_fetch(payload: FetchPayload):
-    # plage de dates
+    t0 = time.perf_counter()
+    # Plages
     if payload.start and payload.end:
         start_d = datetime.fromisoformat(payload.start).date()
         end_d   = datetime.fromisoformat(payload.end).date()
     else:
         end_d = date.today()
         start_d = end_d - timedelta(days=max(1, payload.days))
+    f_start = date.today()
+    f_end   = f_start + timedelta(days=7)
 
     if MOCK:
         return {
             "notes": MOCK_NOTES,
-            "lessons": MOCK_LESSONS,
-            "meta": {"school_url": "MOCK", "range": {"start": start_d.isoformat(), "end": end_d.isoformat()}}
+            "lessons": MOCK_LESSONS_PAST,
+            "lessons_next7": MOCK_LESSONS_NEXT7,
+            "homework_next7": MOCK_HOMEWORK_NEXT7,
+            "meta": {
+                "school_url": "MOCK",
+                "range_past": {"start": start_d.isoformat(), "end": end_d.isoformat()},
+                "range_next7": {"start": f_start.isoformat(), "end": f_end.isoformat()},
+                "status": {"notes":"ok","lessons":"ok","lessons_next7":"ok","homework_next7":"ok"},
+                "timing": {"total_s": round(time.perf_counter()-t0, 3)}
+            }
         }
 
-    # --- Mode réel : Pronote + atrium_sud, pronotepy==2.14.4 ---
-    import pronotepy
-    EXPECTED = "2.14.4"
-    if getattr(pronotepy, "__version__", None) != EXPECTED:
-        raise HTTPException(500, f"pronotepy {pronotepy.__version__} détecté — attendu {EXPECTED}")
-
-    from pronotepy.ent import atrium_sud
+    # --- REAL ---
     try:
+        import pronotepy
+        ver = getattr(pronotepy, "__version__", "unknown")
+        if ver != "2.14.4":
+            raise HTTPException(500, f"pronotepy {ver} détecté — attendu 2.14.4")
+        from pronotepy.ent import atrium_sud
+
         client = pronotepy.Client(PRONOTE_URL, username=payload.username, password=payload.password, ent=atrium_sud)
         if not client.logged_in:
             raise HTTPException(401, "invalid_credentials")
+
+        status: Dict[str,str] = {}
+        timing: Dict[str,float] = {}
+        errors: Dict[str,str] = {}
+
+        # Threads + timeouts (viser total ~ 15–18 s max)
+        # notes: 6s, lessons_past: 6s, lessons_next7: 4s, homework: 4s
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            tasks = {
+                "notes":       lambda: build_notes(client),
+                "lessons":     lambda: build_lessons(client, start_d, end_d),
+                "lessons_next7": lambda: build_lessons(client, f_start, f_end),
+                "homework_next7": lambda: build_homework(client, f_start, f_end),
+            }
+            time_budget = {"notes":6.0, "lessons":6.0, "lessons_next7":4.0, "homework_next7":4.0}
+            results: Dict[str, Any] = {}
+
+            for name, fn in tasks.items():
+                t1 = time.perf_counter()
+                try:
+                    results[name] = with_timeout(ex, fn, time_budget[name])
+                    status[name] = "ok"
+                except FuturesTimeout:
+                    status[name] = "timeout"
+                    errors[name] = f"timeout>{time_budget[name]}s"
+                    results[name] = {"periods": []} if name=="notes" else ({"lessons": []} if "lessons" in name else {"homework": []})
+                except Exception as e:
+                    status[name] = "error"
+                    errors[name] = f"{type(e).__name__}: {e}"
+                    results[name] = {"periods": []} if name=="notes" else ({"lessons": []} if "lessons" in name else {"homework": []})
+                finally:
+                    timing[name] = round(time.perf_counter()-t1, 3)
+
+        timing["total_s"] = round(time.perf_counter()-t0, 3)
+
+        return {
+            "notes": results["notes"],
+            "lessons": results["lessons"],
+            "lessons_next7": results["lessons_next7"],
+            "homework_next7": results["homework_next7"],
+            "meta": {
+                "school_url": PRONOTE_URL,
+                "range_past": {"start": start_d.isoformat(), "end": end_d.isoformat()},
+                "range_next7": {"start": f_start.isoformat(), "end": f_end.isoformat()},
+                "status": status,
+                "errors": errors,
+                "timing": timing,
+                "include_content": INCLUDE_CONTENT
+            }
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(502, f"connexion_pronote_failed: {type(e).__name__}")
 
-    def json_from_notes(client) -> Dict[str, Any]:
-        out = {"periods": []}
-        for period in client.periods:
-            grades = []
-            for g in sorted(period.grades, key=lambda x: x.date or date.min):
-                subj_name = getattr(g.subject, "name", g.subject)
-                subj_code = getattr(g.subject, "code", None)
-                grades.append({
-                    "date": g.date.strftime("%Y-%m-%d") if g.date else None,
-                    "subjectId": subj_code or subj_name,
-                    "subjectLabel": subj_name,
-                    "value": float(g.grade) if g.grade is not None else None,
-                    "outOf": float(g.out_of) if g.out_of is not None else None,
-                    "coefficient": getattr(g, "coefficient", None),
-                    "comment": getattr(g, "comment", None),
-                })
-            out["periods"].append({"name": period.name, "grades": grades})
-        return out
-
-    def json_from_lessons(client, start_d: date, end_d: date) -> Dict[str, Any]:
-        lessons = client.lessons(start_d, end_d)
-        lessons.sort(key=lambda c: (c.start, c.end))
-        arr: List[Dict[str, Any]] = []
-        for c in lessons:
-            subj_name = getattr(c.subject, "name", "?")
-            subj_code = getattr(c.subject, "code", None)
-            arr.append({
-                "date": c.start.strftime("%Y-%m-%d"),
-                "start": c.start.strftime("%H:%M"),
-                "end": c.end.strftime("%H:%M"),
-                "subjectId": subj_code or subj_name,
-                "subjectLabel": subj_name,
-                "room": c.classroom or None,
-                "canceled": bool(c.canceled),
-                "content": {
-                    "title": c.content.title if c.content and c.content.title else None,
-                    "description": c.content.description if c.content and c.content.description else None
-                }
-            })
-        return {"lessons": arr}
-
-    notes = json_from_notes(client)
-    lessons = json_from_lessons(client, start_d, end_d)
-    return {"notes": notes, "lessons": lessons,
-            "meta": {"school_url": PRONOTE_URL, "range": {"start": start_d.isoformat(), "end": end_d.isoformat()}}}
-
-# --- Démarrage pratique via F5 dans Thonny ---
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="127.0.0.1", port=8080, reload=True)
+    uvicorn.run("main:app", host="127.0.0.1", port=8081, log_level="info")
+
