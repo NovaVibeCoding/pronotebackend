@@ -8,13 +8,29 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+from fastapi import Request, Header, HTTPException, Depends
+
+
+
+# Utilisation :
+from fastapi import Depends
+
+
 load_dotenv()
 
 PRONOTE_URL = os.getenv("PRONOTE_URL", "https://0061884r.index-education.net/pronote/eleve.html")
 ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "https://ton-front.example")
 MOCK = os.getenv("MOCK", "0").strip().lower() in {"1","true","yes"} 
 INCLUDE_CONTENT = os.getenv("INCLUDE_CONTENT", "0").strip().lower() in {"1","true","yes"}
+API_KEY = os.getenv("API_KEY", "").strip()
 
+def require_api_key(request: Request, x_api_key: str | None = Header(None)):
+    # Ne pas valider pour preflight OPTIONS
+    if request.method == "OPTIONS":
+        return
+    if API_KEY:
+        if not x_api_key or x_api_key != API_KEY:
+            raise HTTPException(401, "invalid_api_key")
 # ---- Utils ----
 def safe_float(v):
     if v is None:
@@ -54,12 +70,25 @@ class FetchPayload(BaseModel):
 # ---- App ----
 app = FastAPI(title="Pronote JSON API (optimisée)")
 
+from fastapi.middleware.cors import CORSMiddleware
+
+ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*")
+
+# si ALLOW_ORIGINS est "*" ou vide, laissons tout ouvert pour debug
+if ALLOW_ORIGINS.strip() in {"", "*"}:
+    origins = ["*"]
+else:
+    origins = [o.strip() for o in ALLOW_ORIGINS.split(",")]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOW_ORIGINS.split(",")] if ALLOW_ORIGINS else ["*"],
+    allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS", "PUT", "DELETE", "PATCH"],
+    allow_headers=["*"],               # autorise tous les headers, y compris x-api-key
+    expose_headers=["*"],
+    max_age=600
+
 )
 
 # ---- MOCK ----
