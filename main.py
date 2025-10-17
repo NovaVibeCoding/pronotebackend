@@ -21,7 +21,7 @@ load_dotenv()
 PRONOTE_URL = os.getenv("PRONOTE_URL", "https://0061884r.index-education.net/pronote/eleve.html")
 ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "https://ton-front.example")
 MOCK = os.getenv("MOCK", "0").strip().lower() in {"1","true","yes"} 
-INCLUDE_CONTENT = os.getenv("INCLUDE_CONTENT", "0").strip().lower() in {"1","true","yes"}
+INCLUDE_CONTENT = os.getenv("INCLUDE_CONTENT", "1").strip().lower() in {"1","true","yes"}
 API_KEY = os.getenv("API_KEY", "").strip()
 
 def require_api_key(request: Request, x_api_key: str | None = Header(None)):
